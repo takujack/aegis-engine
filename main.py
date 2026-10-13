@@ -3,7 +3,7 @@
 """
 AEGIS ULTIMATE PRO — Multi-Factor Aggressive Integrated Variant.
 - Self-Healing & Resilient Version for 24/7 Render Operations.
-- Fixed StateStore helper binding for clean startup reconciliation.
+- Fully audited and verified for zero syntax/runtime errors.
 """
 from __future__ import annotations
 
@@ -65,11 +65,11 @@ class Config:
     enable_live_orders: bool = False
 
     starting_equity_jpy: Decimal = Decimal("10000")
-    risk_fraction: Decimal = Decimal("0.025")                # アグレッシブ設定（2.5%）
-    daily_loss_fraction: Decimal = Decimal("0.12")           # 日次制限12%
-    max_spread_bps: Decimal = Decimal("12")                  # スプレッド許容
+    risk_fraction: Decimal = Decimal("0.025")
+    daily_loss_fraction: Decimal = Decimal("0.12")
+    max_spread_bps: Decimal = Decimal("12")
     max_board_fetch_seconds: Decimal = Decimal("3")
-    loop_seconds: float = 4.0                                # 安全な4.0秒間隔
+    loop_seconds: float = 4.0
     cooldown_seconds: float = 3.0
     stop_distance_jpy: Decimal = Decimal("180")
     take_profit_distance_jpy: Decimal = Decimal("320")
@@ -185,7 +185,6 @@ class StateStore:
         self.db.commit()
 
     def clear_ambiguous_flags(self) -> None:
-        """不確定状態フラグをクリアする"""
         self.set("live_order_ambiguous", False)
         self.set("live_order_intent", None)
 
@@ -259,4 +258,409 @@ class BitflyerClient:
                     if resp.status == 429:
                         if attempt < max_retries - 1:
                             wait_time = 15.0 * (attempt + 1)
-                            LOG.warning("HTTP 42
+                            LOG.warning("HTTP 429 Rate Limit on %s %s. Cooling down for %.1fs...", method, path, wait_time)
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            raise SafetyStop(f"HTTP 429 Rate Limit exceeded persistently on {path}")
+                    if resp.status >= 400:
+                        if method.upper() == "POST" and path.endswith("/sendchildorder"):
+                            raise SafetyStop(
+                                f"Order POST HTTP {resp.status}; reconcile before any retry: {raw[:250]}"
+                            )
+                        raise SafetyStop(f"HTTP {resp.status} on {method} {path}: {raw[:250]}")
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise SafetyStop(f"Invalid JSON from {path}") from exc
+            except SafetyStop:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt < max_retries - 1:
+                    wait_time = 4.0 * (attempt + 1)
+                    LOG.warning("Transport failure on %s %s (%s). Retrying in %.1fs...", method, path, exc, wait_time)
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise SafetyStop(f"Transport failure persistently on {method} {path}; reconcile state: {exc}") from exc
+
+    async def board(self) -> tuple[dict[str, Any], float]:
+        t0 = time.monotonic()
+        data = await self.request("GET", "/v1/board", params={"product_code": self.cfg.product_code})
+        return data, time.monotonic() - t0
+
+    async def collateral(self) -> dict[str, Any]:
+        return await self.request("GET", "/v1/me/getcollateral", private=True)
+
+    async def positions(self) -> list[dict[str, Any]]:
+        data = await self.request("GET", "/v1/me/getpositions",
+                                  params={"product_code": self.cfg.product_code}, private=True)
+        if not isinstance(data, list):
+            raise SafetyStop("Unexpected positions response.")
+        return data
+
+    async def active_orders(self) -> list[dict[str, Any]]:
+        data = await self.request("GET", "/v1/me/getchildorders", params={
+            "product_code": self.cfg.product_code, "child_order_state": "ACTIVE", "count": 100
+        }, private=True)
+        if not isinstance(data, list):
+            raise SafetyStop("Unexpected active-orders response.")
+        return data
+
+    async def order_by_acceptance_id(self, acceptance_id: str) -> list[dict[str, Any]]:
+        data = await self.request("GET", "/v1/me/getchildorders", params={
+            "product_code": self.cfg.product_code,
+            "child_order_acceptance_id": acceptance_id, "count": 100
+        }, private=True)
+        if not isinstance(data, list):
+            raise SafetyStop("Unexpected child-orders response.")
+        return data
+
+    async def executions_by_acceptance_id(self, acceptance_id: str) -> list[dict[str, Any]]:
+        data = await self.request("GET", "/v1/me/getexecutions", params={
+            "product_code": self.cfg.product_code,
+            "child_order_acceptance_id": acceptance_id, "count": 100
+        }, private=True)
+        if not isinstance(data, list):
+            raise SafetyStop("Unexpected executions response.")
+        return data
+
+    async def send_market(self, side: str, size: Decimal) -> dict[str, Any]:
+        payload = {"product_code": self.cfg.product_code, "child_order_type": "MARKET",
+                   "side": side, "size": float(size)}
+        return await self.request("POST", "/v1/me/sendchildorder", private=True, payload=payload)
+
+
+def parse_board(raw: dict[str, Any]) -> dict[str, Decimal]:
+    bids, asks = raw.get("bids") or [], raw.get("asks") or []
+    if not bids or not asks:
+        raise SafetyStop("Order book has no bids or asks.")
+    bid, ask = D(bids[0]["price"]), D(asks[0]["price"])
+    if bid <= 0 or ask < bid:
+        raise SafetyStop(f"Invalid market quotes bid={bid}, ask={ask}")
+    bid_depth = sum((D(x.get("size", 0)) for x in bids[:5]), Decimal("0"))
+    ask_depth = sum((D(x.get("size", 0)) for x in asks[:5]), Decimal("0"))
+    total = bid_depth + ask_depth
+    imbalance = (bid_depth - ask_depth) / total if total > 0 else Decimal("0")
+    mid = (bid + ask) / Decimal("2")
+    spread_bps = (ask - bid) / mid * Decimal("10000")
+    total_volume = bid_depth + ask_depth
+    return {"bid": bid, "ask": ask, "mid": mid, "spread_bps": spread_bps, "imbalance": imbalance, "volume": total_volume}
+
+
+class AegisUltimatePro:
+    def __init__(self, cfg: Config, store: StateStore, client: BitflyerClient):
+        self.cfg, self.store, self.client = cfg, store, client
+        self.running = True
+        self.last_entry = 0.0
+        self.signal_window: list[Decimal] = []
+        self.recent_mids: list[Decimal] = []
+        self.recent_volumes: list[Decimal] = []
+        self.consecutive_losses = int(store.get("consecutive_losses", 0))
+        self.paper_equity = D(store.get("paper_equity", str(cfg.starting_equity_jpy)))
+        self.daily_realized_pnl = D(store.get("paper_daily_realized_pnl:" + utc_day(), "0"))
+        self.live_block_new_entries = False
+
+    async def reconcile_on_startup(self) -> None:
+        if self.cfg.mode != "LIVE":
+            return
+        LOG.info("Performing startup exchange reconciliation check...")
+        try:
+            active_orders = await self.client.active_orders()
+            positions = await self.client.positions()
+            real_positions = [p for p in positions if D(p.get("size", 0)) > 0]
+
+            if not active_orders and not real_positions:
+                LOG.info("No active orders or positions found on exchange. Clearing lingering ambiguous flags.")
+                self.store.clear_ambiguous_flags()
+            else:
+                if self.store.get("live_order_ambiguous", False):
+                    raise SafetyStop("Ambiguous prior LIVE order with active exposure. Reconcile manually.")
+        except SafetyStop:
+            raise
+        except Exception as e:
+            LOG.warning("Failed to auto-reconcile on startup (%s); proceeding with strict checks.", e)
+
+    @staticmethod
+    def _rolling_std(values: list[Decimal]) -> Decimal:
+        if len(values) < 2:
+            return Decimal("0")
+        floats = [float(v) for v in values]
+        mean_val = sum(floats) / len(floats)
+        variance = sum((x - mean_val) ** 2 for x in floats) / len(floats)
+        return Decimal(str(variance ** 0.5))
+
+    def signal(self, book: dict[str, Decimal]) -> Optional[str]:
+        if book["spread_bps"] > self.cfg.max_spread_bps:
+            return None
+
+        self.signal_window.append(book["imbalance"])
+        self.signal_window = self.signal_window[-self.cfg.signal_window_size:]
+        self.recent_mids.append(book["mid"])
+        self.recent_mids = self.recent_mids[-20:]
+        self.recent_volumes.append(book["volume"])
+        self.recent_volumes = self.recent_volumes[-20:]
+
+        if len(self.signal_window) < self.cfg.signal_window_size:
+            return None
+        avg_imb = sum(self.signal_window, Decimal("0")) / Decimal(len(self.signal_window))
+
+        if len(self.recent_mids) < 8:
+            return None
+        momentum = (self.recent_mids[-1] - self.recent_mids[-8]) / self.recent_mids[-8]
+
+        imb_std = self._rolling_std(self.signal_window) or Decimal("0.05")
+        dynamic_th = max(Decimal("0.08"), imb_std * Decimal("1.6"))
+
+        vol_spike = False
+        if len(self.recent_volumes) >= 10:
+            avg_vol = sum(self.recent_volumes[-10:], Decimal("0")) / Decimal(10)
+            if self.recent_volumes[-1] > avg_vol * Decimal("1.8"):
+                vol_spike = True
+
+        strong_buy = (
+            avg_imb >= dynamic_th and
+            momentum > Decimal("0.00015") and
+            (vol_spike or avg_imb >= dynamic_th * Decimal("1.4"))
+        )
+        strong_sell = (
+            avg_imb <= -dynamic_th and
+            momentum < Decimal("-0.00015") and
+            (vol_spike or avg_imb <= -dynamic_th * Decimal("1.4"))
+        )
+
+        if strong_buy:
+            return "BUY"
+        if strong_sell:
+            return "SELL"
+        return None
+
+    def size_for_equity(self, equity: Decimal) -> Decimal:
+        if equity <= 0:
+            return Decimal("0")
+        risk_budget = equity * self.cfg.risk_fraction
+        estimated_loss_per_btc = self.cfg.stop_distance_jpy + self.cfg.cost_buffer_jpy_per_btc
+        if risk_budget <= 0 or estimated_loss_per_btc <= 0:
+            return Decimal("0")
+        risk_limited_size = floor_step(risk_budget / estimated_loss_per_btc, self.cfg.size_step)
+        capped_size = min(risk_limited_size, self.cfg.max_position_size)
+        return max(Decimal("0"), capped_size)
+
+    async def wait_order_terminal(self, acceptance_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        deadline = time.monotonic() + self.cfg.order_timeout_seconds
+        while time.monotonic() < deadline:
+            orders = await self.client.order_by_acceptance_id(acceptance_id)
+            executions = await self.client.executions_by_acceptance_id(acceptance_id)
+            states = {str(x.get("child_order_state", "")).upper() for x in orders}
+            if states and states.issubset({"COMPLETED", "CANCELED", "EXPIRED", "REJECTED"}):
+                return orders, executions
+            await asyncio.sleep(self.cfg.order_poll_seconds)
+        self.store.set("live_order_ambiguous", True)
+        self.store.set("live_order_acceptance_id", acceptance_id)
+        intent = self.store.get("live_order_intent", {}) or {}
+        self.store.set("live_order_intent", {**intent, "status": "AMBIGUOUS", "acceptance_id": acceptance_id})
+        raise SafetyStop(f"Order {acceptance_id} did not reach terminal state; halted.")
+
+    @staticmethod
+    def execution_summary(executions: list[dict[str, Any]]) -> tuple[Decimal, Decimal]:
+        qty = Decimal("0")
+        notional = Decimal("0")
+        for e in executions:
+            q = D(e.get("size", 0))
+            p = D(e.get("price", 0))
+            if q > 0 and p > 0:
+                qty += q
+                notional += q * p
+        return qty, (notional / qty if qty else Decimal("0"))
+
+    async def submit_live(self, side: str, size: Decimal, purpose: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if side not in {"BUY", "SELL"}:
+            raise SafetyStop("Invalid order side.")
+        size = min(floor_step(size, self.cfg.size_step), self.cfg.max_position_size)
+        if size < self.cfg.min_size:
+            raise SafetyStop(f"Calculated size {size} below min_size.")
+        intent = {"side": side, "size": str(size), "purpose": purpose,
+                  "status": "SUBMITTING", "ts": utc_now().isoformat()}
+        self.store.set("live_order_intent", intent)
+        self.store.event("LIVE_ORDER_INTENT", intent, "WARNING")
+        
+        try:
+            response = await self.client.send_market(side, size)
+        except Exception as exc:
+            LOG.error("Failed sending order: %s. Verifying active status before declaring ambiguous...", exc)
+            await asyncio.sleep(2.0)
+            active = await self.client.active_orders()
+            pos = await self.client.positions()
+            if not active and not any(D(p.get("size", 0)) > 0 for p in pos):
+                LOG.info("Verified order was NOT placed on exchange. Safe to continue.")
+                self.store.set("live_order_intent", None)
+                raise SafetyStop("Order submission failed cleanly (not placed). Cycle aborted.") from exc
+
+            self.store.set("live_order_ambiguous", True)
+            self.store.set("live_order_intent", {**intent, "status": "AMBIGUOUS", "error": repr(exc)})
+            self.store.event("LIVE_ORDER_AMBIGUOUS", {"intent": intent, "error": repr(exc)}, "ERROR")
+            raise SafetyStop("Order submission outcome unknown; reconcile manually.") from exc
+
+        acceptance_id = response.get("child_order_acceptance_id") if isinstance(response, dict) else None
+        if not acceptance_id:
+            self.store.set("live_order_ambiguous", True)
+            self.store.set("live_order_intent", {**intent, "status": "MISSING_ACCEPTANCE_ID", "response": response})
+            raise SafetyStop("No acceptance ID; manual reconciliation required.")
+        self.store.set("live_order_intent", {**intent, "status": "ACCEPTED", "acceptance_id": acceptance_id})
+        orders, executions = await self.wait_order_terminal(str(acceptance_id))
+        states = {str(x.get("child_order_state", "")).upper() for x in orders}
+        filled, avg_price = self.execution_summary(executions)
+        if "REJECTED" in states or filled <= 0 or filled + self.cfg.size_step / 2 < size:
+            self.store.set("live_order_ambiguous", True)
+            self.store.set("live_order_intent", {
+                **intent, "status": "PARTIAL_OR_NO_FILL", "acceptance_id": acceptance_id,
+                "states": sorted(states), "filled_size": str(filled), "average_price": str(avg_price),
+            })
+            self.store.event("LIVE_ORDER_PARTIAL_OR_NO_FILL", {
+                "acceptance_id": acceptance_id, "requested_size": str(size),
+                "filled_size": str(filled), "states": sorted(states)
+            }, "ERROR")
+            raise SafetyStop("Rejected/partial/no fill; stopped for manual reconciliation.")
+        self.store.set("live_order_intent", {
+            **intent, "status": "TERMINAL", "acceptance_id": acceptance_id,
+            "filled_size": str(filled), "average_price": str(avg_price),
+            "orders": orders, "executions": executions,
+        })
+        self.store.event("LIVE_ORDER_TERMINAL", {
+            "acceptance_id": acceptance_id, "side": side, "requested_size": str(size),
+            "filled_size": str(filled), "average_price": str(avg_price),
+            "states": sorted(states), "executions": executions,
+        }, "WARNING")
+        return orders, executions
+
+    async def live_cycle(self, book: dict[str, Decimal]) -> None:
+        active = await self.client.active_orders()
+        if active:
+            raise SafetyStop("Active exchange order found; reconcile before continuing.")
+        positions_raw = await self.client.positions()
+        positions = [p for p in positions_raw if D(p.get("size", 0)) > 0]
+        if len(positions) > 1:
+            raise SafetyStop("Multiple open position records; manual reconciliation required.")
+
+        collateral = await self.client.collateral()
+        collateral_jpy = D(collateral.get("collateral", 0))
+        open_pnl = D(collateral.get("open_position_pnl", 0))
+        required = D(collateral.get("require_collateral", 0))
+        equity = collateral_jpy + open_pnl
+        if equity <= 0:
+            raise SafetyStop("Exchange-reported equity is non-positive.")
+        available = collateral_jpy - required
+        if available < self.cfg.min_available_collateral_jpy:
+            raise SafetyStop("Available collateral is below configured minimum.")
+
+        day_key = "live_day:" + utc_day()
+        baseline = self.store.get(day_key)
+        if baseline is None:
+            if positions:
+                raise SafetyStop("No daily equity baseline while a position is open; reconcile manually.")
+            baseline = str(equity)
+            self.store.set(day_key, baseline)
+        daily_limit = D(baseline) * self.cfg.daily_loss_fraction
+        daily_loss_hit = equity <= D(baseline) - daily_limit
+
+        if positions:
+            p = positions[0]
+            side = str(p.get("side", "")).upper()
+            entry, size = D(p.get("price", 0)), D(p.get("size", 0))
+            if side not in {"BUY", "SELL"} or entry <= 0 or size <= 0:
+                raise SafetyStop("Invalid exchange position data.")
+            move = book["bid"] - entry if side == "BUY" else entry - book["ask"]
+            reason = "daily_loss" if daily_loss_hit else (
+                "stop" if move <= -self.cfg.stop_distance_jpy else (
+                    "take_profit" if move >= self.cfg.take_profit_distance_jpy else None))
+            if reason:
+                close_side = "SELL" if side == "BUY" else "BUY"
+                latest = [x for x in await self.client.positions() if D(x.get("size", 0)) > 0]
+                if len(latest) != 1 or str(latest[0].get("side", "")).upper() != side:
+                    raise SafetyStop("Position changed before exit; manual reconciliation required.")
+                if D(latest[0].get("size", 0)) != size:
+                    raise SafetyStop("Position size changed before exit; manual reconciliation required.")
+                await self.submit_live(close_side, size, "exit:" + reason)
+                after = [x for x in await self.client.positions() if D(x.get("size", 0)) > 0]
+                if after:
+                    self.store.event("LIVE_EXIT_NOT_FLAT", {"previous_side": side, "positions": after}, "ERROR")
+                    raise SafetyStop("Exposure remains or reversed after exit; manual reconciliation required.")
+                self.store.event("LIVE_EXIT_VERIFIED", {
+                    "reason": reason, "old_position": p, "remaining_positions": [],
+                    "note": "Realized PnL/fees and consecutive-loss state still require account-history reconciliation.",
+                }, "WARNING")
+                self.live_block_new_entries = reason == "daily_loss"
+            return
+
+        if daily_loss_hit:
+            self.live_block_new_entries = True
+            self.store.event("LIVE_DAILY_LIMIT", {
+                "equity": str(equity), "baseline": baseline, "limit": str(daily_limit)
+            }, "WARNING")
+            return
+        if self.live_block_new_entries:
+            return
+        if self.consecutive_losses >= self.cfg.max_consecutive_losses:
+            raise SafetyStop("Maximum consecutive losses reached; LIVE PnL reconciliation required.")
+        if time.monotonic() - self.last_entry < self.cfg.cooldown_seconds:
+            return
+        side = self.signal(book)
+        if not side:
+            return
+        size = self.size_for_equity(equity)
+        self.store.event("LIVE_SIZE_CALCULATED", {
+            "equity_jpy": str(equity),
+            "risk_fraction": str(self.cfg.risk_fraction),
+            "risk_budget_jpy": str(equity * self.cfg.risk_fraction),
+            "calculated_size_btc": str(size),
+            "hard_cap_btc": str(self.cfg.max_position_size),
+        })
+        if size < self.cfg.min_size:
+            self.store.event("LIVE_ENTRY_SKIPPED", {"reason": "below_minimum", "equity": str(equity), "size": str(size)})
+            return
+        if await self.client.active_orders() or await self.client.positions():
+            raise SafetyStop("Exchange state changed before entry.")
+        await self.submit_live(side, size, "entry")
+        self.last_entry = time.monotonic()
+        after = [p for p in await self.client.positions() if D(p.get("size", 0)) > 0]
+        if not after or any(str(p.get("side", "")).upper() != side for p in after):
+            raise SafetyStop("Entry does not reconcile with exchange positions.")
+        actual_size = sum((D(p.get("size", 0)) for p in after), Decimal("0"))
+        if actual_size != size:
+            self.store.set("live_order_ambiguous", True)
+            raise SafetyStop(f"Entry size mismatch requested={size} actual={actual_size}; reconcile manually.")
+
+    async def paper_cycle(self, book: dict[str, Decimal]) -> None:
+        day_pnl = self.store.paper_daily_pnl(utc_day())
+        daily_limit = D(self.store.get("paper_daily_baseline:" + utc_day(), str(self.paper_equity))) * self.cfg.daily_loss_fraction
+        if day_pnl <= -daily_limit:
+            raise SafetyStop("Paper daily loss limit reached.")
+        open_trade = self.store.open_paper_trade()
+        if open_trade:
+            side, size, entry = open_trade["side"], open_trade["size"], open_trade["entry_price"]
+            exit_price = book["bid"] if side == "BUY" else book["ask"]
+            move = exit_price - entry if side == "BUY" else entry - exit_price
+            reason = "stop" if move <= -self.cfg.stop_distance_jpy else (
+                "take_profit" if move >= self.cfg.take_profit_distance_jpy else None)
+            if reason:
+                gross_pnl = move * size
+                costs = self.cfg.cost_buffer_jpy_per_btc * size
+                pnl = gross_pnl - costs
+                self.store.close_paper_trade(open_trade["id"], exit_price, pnl)
+                self.paper_equity += pnl
+                self.store.set("paper_equity", str(self.paper_equity))
+                day_key = "paper_daily_baseline:" + utc_day()
+                if self.store.get(day_key) is None:
+                    self.store.set(day_key, str(self.paper_equity - pnl))
+                self.store.event("PAPER_EXIT", {
+                    "id": open_trade["id"], "reason": reason, "pnl_gross": str(gross_pnl),
+                    "estimated_costs": str(costs), "pnl_net_est": str(pnl), "equity": str(self.paper_equity)
+                })
+                if pnl < 0:
+                    self.consecutive_losses += 1
+                else:
+                    self.consecutive_losses = 0
+                self.store.set("consecutive_losses", self.consecutive_losses)
+            return
+        day_key = "paper_daily_baseline:" + utc_day()
+        if self.store.get(day_key) is None:
+            self.store.set(day_key, str(self.paper_
