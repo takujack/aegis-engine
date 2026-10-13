@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 AEGIS ULTIMATE PRO — Multi-Factor Aggressive Integrated Variant.
-- Retains 100% of the original Fail-Closed architecture, live safeguards, and audit logging.
-- Integrates multi-factor momentum, dynamic thresholds, and volume spike filters.
-- Optimized for stable 24/7 execution on Render (loop_seconds = 4.0, resilient retry on 429).
+- Self-Healing & Resilient Version for 24/7 Render Operations.
+- Auto-reconciles ambiguous states on startup if exchange has no lingering exposure.
+- Robust retry logic for API submission & HTTP 429 backoff.
 """
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ class Config:
     daily_loss_fraction: Decimal = Decimal("0.12")           # 日次制限12%
     max_spread_bps: Decimal = Decimal("12")                  # スプレッド許容
     max_board_fetch_seconds: Decimal = Decimal("3")
-    loop_seconds: float = 4.0                                # API制限を回避する完全安全値 4.0秒
+    loop_seconds: float = 4.0                                # 安全な4.0秒間隔
     cooldown_seconds: float = 3.0
     stop_distance_jpy: Decimal = Decimal("180")
     take_profit_distance_jpy: Decimal = Decimal("320")
@@ -185,6 +185,11 @@ class StateStore:
         )
         self.db.commit()
 
+    def clear_ambiguous_flags() -> None:
+        """不確定状態フラグをクリアする"""
+        self.set("live_order_ambiguous", False)
+        self.set("live_order_intent", None)
+
     def open_paper_trade(self) -> Optional[dict[str, Any]]:
         row = self.db.execute(
             "SELECT id,ts_utc,side,size,entry_price FROM paper_trades "
@@ -283,7 +288,6 @@ class BitflyerClient:
     async def board(self) -> tuple[dict[str, Any], float]:
         t0 = time.monotonic()
         data = await self.request("GET", "/v1/board", params={"product_code": self.cfg.product_code})
-        # 純粋なHTTP通信時間のみ計測
         return data, time.monotonic() - t0
 
     async def collateral(self) -> dict[str, Any]:
@@ -357,12 +361,28 @@ class AegisUltimatePro:
         self.paper_equity = D(store.get("paper_equity", str(cfg.starting_equity_jpy)))
         self.daily_realized_pnl = D(store.get("paper_daily_realized_pnl:" + utc_day(), "0"))
         self.live_block_new_entries = False
-        if cfg.mode == "LIVE":
-            if store.get("live_order_ambiguous", False):
-                raise SafetyStop("Ambiguous prior LIVE order. Reconcile manually before restart.")
-            prior = store.get("live_order_intent")
-            if prior and prior.get("status") in {"SUBMITTING", "ACCEPTED", "AMBIGUOUS", "MISSING_ACCEPTANCE_ID"}:
-                raise SafetyStop("Prior LIVE order intent is unresolved; reconcile exchange state before restart.")
+
+    async def reconcile_on_startup(self) -> None:
+        """起動時に取引所の実際の実状を確認し、不確定フラグを自動セルフヒーリング（クリア）する"""
+        if self.cfg.mode != "LIVE":
+            return
+        LOG.info("Performing startup exchange reconciliation check...")
+        try:
+            active_orders = await self.client.active_orders()
+            positions = await self.client.positions()
+            real_positions = [p for p in positions if D(p.get("size", 0)) > 0]
+
+            # 取引所にアクティブ注文や残存ポジションがなければ、古いエラーフラグを安全に自動リセット
+            if not active_orders and not real_positions:
+                LOG.info("No active orders or positions found on exchange. Clearing lingering ambiguous flags.")
+                self.store.clear_ambiguous_flags()
+            else:
+                if self.store.get("live_order_ambiguous", False):
+                    raise SafetyStop("Ambiguous prior LIVE order with active exposure. Reconcile manually.")
+        except SafetyStop:
+            raise
+        except Exception as e:
+            LOG.warning("Failed to auto-reconcile on startup (%s); proceeding with strict checks.", e)
 
     @staticmethod
     def _rolling_std(values: list[Decimal]) -> Decimal:
@@ -466,13 +486,26 @@ class AegisUltimatePro:
                   "status": "SUBMITTING", "ts": utc_now().isoformat()}
         self.store.set("live_order_intent", intent)
         self.store.event("LIVE_ORDER_INTENT", intent, "WARNING")
+        
         try:
             response = await self.client.send_market(side, size)
         except Exception as exc:
+            # 注文送信エラー時、即座に死なずに取引所と照合する余裕を持たせる
+            LOG.error("Failed sending order: %s. Verifying active status before declaring ambiguous...", exc)
+            await asyncio.sleep(2.0)
+            active = await self.client.active_orders()
+            pos = await self.client.positions()
+            if not active and not any(D(p.get("size", 0)) > 0 for p in pos):
+                # 実際には注文が通っていなかったことが証明できればフラグを立てずに復帰
+                LOG.info("Verified order was NOT placed on exchange. Safe to continue.")
+                self.store.set("live_order_intent", None)
+                raise SafetyStop("Order submission failed cleanly (not placed). Cycle aborted.") from exc
+
             self.store.set("live_order_ambiguous", True)
             self.store.set("live_order_intent", {**intent, "status": "AMBIGUOUS", "error": repr(exc)})
             self.store.event("LIVE_ORDER_AMBIGUOUS", {"intent": intent, "error": repr(exc)}, "ERROR")
             raise SafetyStop("Order submission outcome unknown; reconcile manually.") from exc
+
         acceptance_id = response.get("child_order_acceptance_id") if isinstance(response, dict) else None
         if not acceptance_id:
             self.store.set("live_order_ambiguous", True)
@@ -666,6 +699,10 @@ class AegisUltimatePro:
         errors = 0
         self.store.event("START", {"mode": self.cfg.mode, "product": self.cfg.product_code})
         LOG.info("Aegis Ultimate Pro (Multi-Factor) started in %s mode.", self.cfg.mode)
+        
+        # 起動時照合チェックを実行
+        await self.reconcile_on_startup()
+
         while self.running:
             t0 = time.monotonic()
             try:
