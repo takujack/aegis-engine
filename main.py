@@ -663,4 +663,108 @@ class AegisUltimatePro:
             return
         day_key = "paper_daily_baseline:" + utc_day()
         if self.store.get(day_key) is None:
-            self.store.set(day_key, str(self.paper_
+            self.store.set(day_key, str(self.paper_equity))
+        if self.consecutive_losses >= self.cfg.max_consecutive_losses:
+            raise SafetyStop("Paper max consecutive losses reached.")
+        if time.monotonic() - self.last_entry < self.cfg.cooldown_seconds:
+            return
+        side = self.signal(book)
+        if not side:
+            return
+        size = self.size_for_equity(self.paper_equity)
+        self.store.event("PAPER_SIZE_CALCULATED", {
+            "equity_jpy": str(self.paper_equity),
+            "risk_fraction": str(self.cfg.risk_fraction),
+            "risk_budget_jpy": str(self.paper_equity * self.cfg.risk_fraction),
+            "calculated_size_btc": str(size),
+            "hard_cap_btc": str(self.cfg.max_position_size),
+        })
+        if size < self.cfg.min_size:
+            return
+        entry = book["ask"] if side == "BUY" else book["bid"]
+        trade_id = self.store.create_paper_trade(side, size, entry)
+        self.last_entry = time.monotonic()
+        self.store.event("PAPER_ENTRY", {
+            "id": trade_id, "side": side, "size": str(size), "entry": str(entry),
+            "spread_bps": str(book["spread_bps"]), "imbalance": str(book["imbalance"])
+        })
+
+    async def run(self) -> None:
+        errors = 0
+        self.store.event("START", {"mode": self.cfg.mode, "product": self.cfg.product_code})
+        LOG.info("Aegis Ultimate Pro (Multi-Factor) started in %s mode.", self.cfg.mode)
+        
+        await self.reconcile_on_startup()
+
+        while self.running:
+            t0 = time.monotonic()
+            try:
+                raw, latency = await self.client.board()
+                if latency > float(self.cfg.max_board_fetch_seconds):
+                    raise SafetyStop(f"Board fetch latency too high: {latency:.3f}s")
+                book = parse_board(raw)
+                if self.cfg.mode == "PAPER":
+                    await self.paper_cycle(book)
+                else:
+                    await self.live_cycle(book)
+                errors = 0
+            except asyncio.CancelledError:
+                raise
+            except SafetyStop as exc:
+                self.store.event("SAFETY_STOP", {"error": str(exc)}, "ERROR")
+                LOG.error("SAFETY STOP: %s", exc)
+                self.running = False
+            except Exception as exc:
+                errors += 1
+                self.store.event("ERROR", {"error": repr(exc), "count": errors}, "ERROR")
+                LOG.exception("Cycle failed (%s/%s)", errors, self.cfg.max_consecutive_errors)
+                if errors >= self.cfg.max_consecutive_errors:
+                    self.store.event("SAFETY_STOP", {"reason": "too_many_consecutive_errors"}, "ERROR")
+                    self.running = False
+                else:
+                    await asyncio.sleep(min(4.0 * errors, 20.0))
+            elapsed = time.monotonic() - t0
+            if self.running and elapsed < self.cfg.loop_seconds:
+                await asyncio.sleep(self.cfg.loop_seconds - elapsed)
+
+        if self.cfg.mode == "LIVE":
+            try:
+                pos = [p for p in await self.client.positions() if D(p.get("size", 0)) > 0]
+                orders = await self.client.active_orders()
+                if pos or orders:
+                    LOG.critical("SHUTDOWN AUDIT: positions=%s active_orders=%s", pos, orders)
+                    self.store.event("SHUTDOWN_EXPOSURE_REMAINS", {"positions": pos, "active_orders": orders}, "CRITICAL")
+            except Exception as exc:
+                LOG.critical("SHUTDOWN AUDIT FAILED: %r", exc)
+                self.store.event("SHUTDOWN_AUDIT_FAILED", {"error": repr(exc)}, "CRITICAL")
+        self.store.event("ENGINE_STOP", {"mode": self.cfg.mode})
+        LOG.info("Aegis stopped.")
+
+
+async def async_main() -> int:
+    cfg = Config.from_env()
+    cfg.validate()
+    store = StateStore(cfg.db_path)
+    timeout = aiohttp.ClientTimeout(total=cfg.request_timeout_seconds)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            client = BitflyerClient(session, cfg)
+            engine = AegisUltimatePro(cfg, store, client)
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, setattr, engine, "running", False)
+                except (NotImplementedError, RuntimeError):
+                    pass
+            await engine.run()
+    finally:
+        store.close()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(asyncio.run(async_main()))
+    except SafetyStop as exc:
+        LOG.error("Aegis refused to start/continue: %s", exc)
+        raise SystemExit(2)
