@@ -4,6 +4,7 @@
 AEGIS ULTIMATE PRO — Multi-Factor Aggressive Integrated Variant.
 - Retains 100% of the original Fail-Closed architecture, live safeguards, and audit logging.
 - Integrates multi-factor momentum, dynamic thresholds, and volume spike filters.
+- Enhanced with loop_seconds = 2.3 and HTTP 429 / transient error resilience.
 """
 from __future__ import annotations
 
@@ -69,7 +70,7 @@ class Config:
     daily_loss_fraction: Decimal = Decimal("0.12")           # 日次制限12%
     max_spread_bps: Decimal = Decimal("12")                  # スプレッド許容
     max_board_fetch_seconds: Decimal = Decimal("3")
-    loop_seconds: float = 0.8
+    loop_seconds: float = 2.3                                # レート制限を回避する安全な2.3秒
     cooldown_seconds: float = 3.0
     stop_distance_jpy: Decimal = Decimal("180")
     take_profit_distance_jpy: Decimal = Decimal("320")
@@ -82,7 +83,7 @@ class Config:
     order_poll_seconds: float = 0.4
     order_timeout_seconds: float = 12.0
     request_timeout_seconds: float = 5.0
-    max_consecutive_errors: int = 4
+    max_consecutive_errors: int = 6
     db_path: str = "aegis_ultimate_pro.sqlite3"
     signal_window_size: int = 4
 
@@ -242,26 +243,43 @@ class BitflyerClient:
             headers = {"ACCESS-KEY": self.cfg.api_key, "ACCESS-TIMESTAMP": timestamp,
                        "ACCESS-SIGN": signature, "Content-Type": "application/json"}
         url = self.cfg.api_base.rstrip("/") + signed_path
-        try:
-            async with self.session.request(
-                method.upper(), url, data=body if payload is not None else None,
-                headers=headers, timeout=aiohttp.ClientTimeout(total=self.cfg.request_timeout_seconds),
-            ) as resp:
-                raw = await resp.text()
-                if resp.status >= 400:
-                    if method.upper() == "POST" and path.endswith("/sendchildorder"):
-                        raise SafetyStop(
-                            f"Order POST HTTP {resp.status}; reconcile before any retry: {raw[:250]}"
-                        )
-                    raise SafetyStop(f"HTTP {resp.status} on {method} {path}: {raw[:250]}")
-                try:
-                    return json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise SafetyStop(f"Invalid JSON from {path}") from exc
-        except SafetyStop:
-            raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise SafetyStop(f"Transport failure on {method} {path}; reconcile state: {exc}") from exc
+        
+        # HTTP 429や一時的エラーに対する自動リトライラッパー
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self.session.request(
+                    method.upper(), url, data=body if payload is not None else None,
+                    headers=headers, timeout=aiohttp.ClientTimeout(total=self.cfg.request_timeout_seconds),
+                ) as resp:
+                    raw = await resp.text()
+                    if resp.status == 429:
+                        if attempt < max_retries - 1:
+                            wait_time = 5.0 * (attempt + 1)
+                            LOG.warning("HTTP 429 Rate Limit on %s %s. Retrying in %.1fs...", method, path, wait_time)
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            raise SafetyStop(f"HTTP 429 Rate Limit exceeded persistently on {path}")
+                    if resp.status >= 400:
+                        if method.upper() == "POST" and path.endswith("/sendchildorder"):
+                            raise SafetyStop(
+                                f"Order POST HTTP {resp.status}; reconcile before any retry: {raw[:250]}"
+                            )
+                        raise SafetyStop(f"HTTP {resp.status} on {method} {path}: {raw[:250]}")
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise SafetyStop(f"Invalid JSON from {path}") from exc
+            except SafetyStop:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt < max_retries - 1:
+                    wait_time = 3.0 * (attempt + 1)
+                    LOG.warning("Transport failure on %s %s (%s). Retrying in %.1fs...", method, path, exc, wait_time)
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise SafetyStop(f"Transport failure persistently on {method} {path}; reconcile state: {exc}") from exc
 
     async def board(self) -> tuple[dict[str, Any], float]:
         t0 = time.monotonic()
@@ -323,7 +341,6 @@ def parse_board(raw: dict[str, Any]) -> dict[str, Decimal]:
     imbalance = (bid_depth - ask_depth) / total if total > 0 else Decimal("0")
     mid = (bid + ask) / Decimal("2")
     spread_bps = (ask - bid) / mid * Decimal("10000")
-    # マルチファクター用の出来高プロキシ（上位5本の総厚み）
     total_volume = bid_depth + ask_depth
     return {"bid": bid, "ask": ask, "mid": mid, "spread_bps": spread_bps, "imbalance": imbalance, "volume": total_volume}
 
@@ -360,7 +377,6 @@ class AegisUltimatePro:
         if book["spread_bps"] > self.cfg.max_spread_bps:
             return None
         
-        # 履歴の蓄積・更新
         self.signal_window.append(book["imbalance"])
         self.signal_window = self.signal_window[-self.cfg.signal_window_size:]
         self.recent_mids.append(book["mid"])
@@ -372,23 +388,19 @@ class AegisUltimatePro:
             return None
         avg_imb = sum(self.signal_window, Decimal("0")) / Decimal(len(self.signal_window))
 
-        # 短期モメンタムチェック
         if len(self.recent_mids) < 8:
             return None
         momentum = (self.recent_mids[-1] - self.recent_mids[-8]) / self.recent_mids[-8]
 
-        # 動的閾値
         imb_std = self._rolling_std(self.signal_window) or Decimal("0.05")
         dynamic_th = max(Decimal("0.08"), imb_std * Decimal("1.6"))
 
-        # 出来高急増チェック
         vol_spike = False
         if len(self.recent_volumes) >= 10:
             avg_vol = sum(self.recent_volumes[-10:], Decimal("0")) / Decimal(10)
             if self.recent_volumes[-1] > avg_vol * Decimal("1.8"):
                 vol_spike = True
 
-        # マルチファクター判定条件
         strong_buy = (
             avg_imb >= dynamic_th and
             momentum > Decimal("0.00015") and
@@ -680,7 +692,7 @@ class AegisUltimatePro:
                     self.store.event("SAFETY_STOP", {"reason": "too_many_consecutive_errors"}, "ERROR")
                     self.running = False
                 else:
-                    await asyncio.sleep(min(2 ** errors, 15))
+                    await asyncio.sleep(min(3.0 * errors, 15.0))
             elapsed = time.monotonic() - t0
             if self.running and elapsed < self.cfg.loop_seconds:
                 await asyncio.sleep(self.cfg.loop_seconds - elapsed)
