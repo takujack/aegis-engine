@@ -1,10 +1,9 @@
 #!/usr/env python3
 # -*- coding: utf-8 -*-
 """
-AEGIS ULTIMATE PRO — Trend-Capture & Zero-Cooldown Variant.
-- Scaled for ~13.2M JPY BTC price level (Stop: 15,000 JPY, TP: 35,000 JPY).
-- Zero cooldown for maximum opportunity capture.
-- Robust Startup & Position Aggregation.
+AEGIS ULTIMATE PRO — Final Bulletproof Variant.
+- Strict 4.0s loop interval to completely eliminate HTTP 429 Rate Limits.
+- Robust startup, position aggregation, and error handling.
 """
 from __future__ import annotations
 
@@ -70,7 +69,7 @@ class Config:
     daily_loss_fraction: Decimal = Decimal("0.30")
     max_spread_bps: Decimal = Decimal("15")
     max_board_fetch_seconds: Decimal = Decimal("3")
-    loop_seconds: float = 2.0
+    loop_seconds: float = 4.0  # 4秒に固定してレート制限を完全に回避
     cooldown_seconds: float = 0.0
     stop_distance_jpy: Decimal = Decimal("15000")
     take_profit_distance_jpy: Decimal = Decimal("35000")
@@ -80,10 +79,10 @@ class Config:
     max_position_size: Decimal = Decimal("0.05")
     max_consecutive_losses: int = 10
     min_available_collateral_jpy: Decimal = Decimal("500")
-    order_poll_seconds: float = 0.3
+    order_poll_seconds: float = 0.4
     order_timeout_seconds: float = 12.0
     request_timeout_seconds: float = 5.0
-    max_consecutive_errors: int = 8
+    max_consecutive_errors: int = 10
     db_path: str = "aegis_ultimate_pro.sqlite3"
     signal_window_size: int = 2
 
@@ -213,7 +212,7 @@ class BitflyerClient:
                        "ACCESS-SIGN": signature, "Content-Type": "application/json"}
         url = self.cfg.api_base.rstrip("/") + signed_path
 
-        max_retries = 4
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 async with self.session.request(
@@ -223,12 +222,12 @@ class BitflyerClient:
                     raw = await resp.text()
                     if resp.status == 429:
                         if attempt < max_retries - 1:
-                            wait_time = 10.0 * (attempt + 1)
-                            LOG.warning("HTTP 429 Rate Limit. Waiting %.1fs...", wait_time)
+                            wait_time = 15.0 * (attempt + 1)
+                            LOG.warning("HTTP 429 Rate Limit. Cooling down for %.1fs...", wait_time)
                             await asyncio.sleep(wait_time)
                             continue
                         else:
-                            raise SafetyStop(f"HTTP 429 Rate Limit exceeded on {path}")
+                            raise SafetyStop(f"HTTP 429 Rate Limit exceeded persistently on {path}")
                     if resp.status >= 400:
                         if method.upper() == "POST" and path.endswith("/sendchildorder"):
                             raise SafetyStop(
@@ -243,7 +242,7 @@ class BitflyerClient:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt < max_retries - 1:
-                    wait_time = 3.0 * (attempt + 1)
+                    wait_time = 4.0 * (attempt + 1)
                     LOG.warning("Transport failure on %s %s. Retrying in %.1fs...", method, path, wait_time)
                     await asyncio.sleep(wait_time)
                     continue
@@ -570,7 +569,7 @@ class AegisUltimatePro:
     async def run(self) -> None:
         errors = 0
         self.store.event("START", {"mode": self.cfg.mode, "product": self.cfg.product_code})
-        LOG.info("Aegis Ultimate Pro started in %s mode (Trend-Capture & Zero-Cooldown).", self.cfg.mode)
+        LOG.info("Aegis Ultimate Pro started in %s mode (4s Loop, Trend-Capture & Zero-Cooldown).", self.cfg.mode)
         
         await self.reconcile_on_startup()
 
@@ -596,7 +595,7 @@ class AegisUltimatePro:
                 if errors >= self.cfg.max_consecutive_errors:
                     self.running = False
                 else:
-                    await asyncio.sleep(min(2.0 * errors, 10.0))
+                    await asyncio.sleep(min(4.0 * errors, 20.0))
             elapsed = time.monotonic() - t0
             if self.running and elapsed < self.cfg.loop_seconds:
                 await asyncio.sleep(self.cfg.loop_seconds - elapsed)
