@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 AEGIS ULTIMATE PRO — bitFlyer FX_BTC_JPY trend engine.
-Auto-reconciliation fix: Automatically clears stale local state when exchange is flat.
+Includes pre-order margin validation to prevent -205 insufficient margin errors.
 """
 
 from __future__ import annotations
@@ -341,12 +341,25 @@ class Aegis:
             return "SELL"
         return None
 
-    def size_for_risk(self, equity: Decimal) -> Decimal:
+    def size_for_risk(self, equity: Decimal, mid_price: Decimal, free_collateral: Decimal) -> Decimal:
         risk_budget = equity * self.cfg.risk_per_trade
         cost_per_btc = self.cfg.stop_distance_jpy * self.cfg.estimated_round_trip_cost_bps / Decimal("10000")
         raw = risk_budget / (self.cfg.stop_distance_jpy + cost_per_btc)
         size = floor_step(min(raw, self.cfg.max_position_size), self.cfg.size_step)
-        return size if size >= self.cfg.min_size else ZERO
+        if size < self.cfg.min_size:
+            return ZERO
+        
+        # bitFlyer FX_BTC_JPY の必要証拠金のおおよその目安（レバレッジ約2倍を考慮し、ポジション価値の約50%が必要）
+        # 安全のため、必要証拠金が現在の利用可能証拠金 (free_collateral) を超えていないかを厳格にチェック
+        required_margin = (size * mid_price) / Decimal("2")
+        if required_margin > free_collateral:
+            LOG.warning("Calculated size %s requires margin %s JPY, but free collateral is %s JPY. Adjusting size down.", size, required_margin, free_collateral)
+            # 証拠金に合わせてサイズを最小単位（0.001）まで落とすか、ゼロにする
+            if free_collateral >= (self.cfg.min_size * mid_price) / Decimal("2"):
+                return self.cfg.min_size
+            return ZERO
+            
+        return size
 
     async def confirm_order(self, acceptance_id: str, timeout_seconds: float = 15.0) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_seconds
@@ -362,17 +375,20 @@ class Aegis:
             self.store.event("ORDER_STILL_ACTIVE", acceptance_id=acceptance_id, state=last.get("child_order_state"))
         raise SafetyStop(f"Order status not terminal within {timeout_seconds}s.")
 
-    async def live_equity(self) -> Decimal:
+    async def live_equity_and_collateral(self) -> tuple[Decimal, Decimal]:
         c = await self.api.collateral()
-        equity = dec(c.get("collateral")) + dec(c.get("open_position_pnl", 0))
+        collateral = dec(c.get("collateral", 0))
+        open_pnl = dec(c.get("open_position_pnl", 0))
+        equity = collateral + open_pnl
+        # 利用可能証拠金 (free collateral) の取得（APIの仕様に合わせて安全にフォールバック）
+        free_collateral = dec(c.get("keep_rate", collateral)) # bitFlyerではcollateralが実質的な証拠金ベース
         if equity <= ZERO:
             raise SafetyStop("Exchange equity is zero/invalid.")
-        return equity
+        return equity, collateral
 
     async def reconcile_live_position(self) -> Optional[dict[str, Any]]:
         positions = await self.api.positions()
         if not positions:
-            # 取引所側がフラットな場合、ローカルに古いポジション情報が残っていれば自動でクリーンアップする
             if self.position is not None:
                 self.store.event("AUTO_CLEAN_STALE_POSITION", local=self.position, exchange="flat")
                 self.position = None
@@ -395,7 +411,6 @@ class Aegis:
             self.store.event("POSITION_ADOPTED", **exchange_pos)
         else:
             if self.position["side"] != side or dec(self.position["size"]) != total:
-                # 数量や方向が変わっている場合は取引所側の実態に自動同期
                 self.position = exchange_pos
                 self.persist_position()
                 self.store.event("POSITION_SYNCED", **exchange_pos)
@@ -424,7 +439,7 @@ class Aegis:
                 raise SafetyStop(f"Pending order {pending} still active.")
             self.store.set("pending_acceptance_id", None)
 
-        self.equity = await self.live_equity()
+        self.equity, free_collateral = await self.live_equity_and_collateral()
         self.roll_day()
         pos = await self.reconcile_live_position()
 
@@ -472,8 +487,11 @@ class Aegis:
         side = self.signal(book)
         if not side:
             return
-        size = self.size_for_risk(self.equity)
+            
+        # 証拠金チェック付きのサイズ計算を呼び出し
+        size = self.size_for_risk(self.equity, book["mid"], free_collateral)
         if size <= ZERO:
+            self.store.event("SKIP_ENTRY", reason="insufficient_margin_or_risk_budget", free_collateral=str(free_collateral))
             return
         
         order = await self.execute_live_order(side, size, "ENTRY")
