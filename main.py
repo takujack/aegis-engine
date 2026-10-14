@@ -3,8 +3,8 @@
 """
 AEGIS ULTIMATE PRO — Trend-Capture & Zero-Cooldown Variant.
 - Scaled for ~13.2M JPY BTC price level (Stop: 15,000 JPY, TP: 35,000 JPY).
-- Zero cooldown for maximum opportunity capture without waiting.
-- Position Aggregation for split fills fully active.
+- Zero cooldown for maximum opportunity capture.
+- Robust Startup & Position Aggregation.
 """
 from __future__ import annotations
 
@@ -67,13 +67,13 @@ class Config:
 
     starting_equity_jpy: Decimal = Decimal("10000")
     risk_fraction: Decimal = Decimal("0.025")
-    daily_loss_fraction: Decimal = Decimal("0.20")
+    daily_loss_fraction: Decimal = Decimal("0.30")
     max_spread_bps: Decimal = Decimal("15")
     max_board_fetch_seconds: Decimal = Decimal("3")
     loop_seconds: float = 2.0
-    cooldown_seconds: float = 0.0  # クールダウン完全撤廃
-    stop_distance_jpy: Decimal = Decimal("15000")  # BTC 1,320万円水準の損切り幅 (0.001BTC時: 15円損)
-    take_profit_distance_jpy: Decimal = Decimal("35000")  # 利幅 (0.001BTC時: 35円益)
+    cooldown_seconds: float = 0.0
+    stop_distance_jpy: Decimal = Decimal("15000")
+    take_profit_distance_jpy: Decimal = Decimal("35000")
     cost_buffer_jpy_per_btc: Decimal = Decimal("100")
     min_size: Decimal = Decimal("0.001")
     size_step: Decimal = Decimal("0.001")
@@ -85,7 +85,7 @@ class Config:
     request_timeout_seconds: float = 5.0
     max_consecutive_errors: int = 8
     db_path: str = "aegis_ultimate_pro.sqlite3"
-    signal_window_size: int = 2  # 高速シグナル反応
+    signal_window_size: int = 2
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -129,8 +129,8 @@ class Config:
             raise SafetyStop("starting_equity_jpy must be positive.")
         if not (Decimal("0") < self.risk_fraction <= Decimal("0.05")):
             raise SafetyStop("risk_fraction must be in (0, 0.05].")
-        if not (Decimal("0") < self.daily_loss_fraction <= Decimal("0.30")):
-            raise SafetyStop("daily_loss_fraction must be in (0, 0.30].")
+        if not (Decimal("0") < self.daily_loss_fraction <= Decimal("0.40")):
+            raise SafetyStop("daily_loss_fraction must be in (0, 0.40].")
         if self.stop_distance_jpy <= 0 or self.take_profit_distance_jpy <= 0:
             raise SafetyStop("Stop and take-profit distances must be positive.")
         if self.cost_buffer_jpy_per_btc < 0:
@@ -188,41 +188,6 @@ class StateStore:
     def clear_ambiguous_flags(self) -> None:
         self.set("live_order_ambiguous", False)
         self.set("live_order_intent", None)
-
-    def open_paper_trade(self) -> Optional[dict[str, Any]]:
-        row = self.db.execute(
-            "SELECT id,ts_utc,side,size,entry_price FROM paper_trades "
-            "WHERE status='OPEN' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if not row:
-            return None
-        return {"id": row[0], "ts_utc": row[1], "side": row[2],
-                "size": D(row[3]), "entry_price": D(row[4])}
-
-    def create_paper_trade(self, side: str, size: Decimal, price: Decimal) -> int:
-        cur = self.db.execute(
-            "INSERT INTO paper_trades(ts_utc,side,size,entry_price,status) VALUES(?,?,?,?,?)",
-            (utc_now().isoformat(), side, str(size), str(price), "OPEN"),
-        )
-        self.db.commit()
-        return int(cur.lastrowid)
-
-    def close_paper_trade(self, trade_id: int, price: Decimal, pnl: Decimal) -> None:
-        cur = self.db.execute(
-            "UPDATE paper_trades SET exit_price=?,pnl=?,status='CLOSED',closed_ts_utc=? "
-            "WHERE id=? AND status='OPEN'",
-            (str(price), str(pnl), utc_now().isoformat(), trade_id),
-        )
-        self.db.commit()
-        if cur.rowcount != 1:
-            raise SafetyStop("Paper trade state conflict while closing.")
-
-    def paper_daily_pnl(self, day: str) -> Decimal:
-        rows = self.db.execute(
-            "SELECT pnl FROM paper_trades WHERE status='CLOSED' AND substr(closed_ts_utc,1,10)=?",
-            (day,),
-        ).fetchall()
-        return sum((D(r[0]) for r in rows if r[0] is not None), Decimal("0"))
 
     def close(self) -> None:
         self.db.close()
@@ -356,8 +321,6 @@ class AegisUltimatePro:
         self.recent_mids: list[Decimal] = []
         self.recent_volumes: list[Decimal] = []
         self.consecutive_losses = int(store.get("consecutive_losses", 0))
-        self.paper_equity = D(store.get("paper_equity", str(cfg.starting_equity_jpy)))
-        self.daily_realized_pnl = D(store.get("paper_daily_realized_pnl:" + utc_day(), "0"))
         self.live_block_new_entries = False
 
     async def reconcile_on_startup(self) -> None:
@@ -551,8 +514,6 @@ class AegisUltimatePro:
         day_key = "live_day:" + utc_day()
         baseline = self.store.get(day_key)
         if baseline is None:
-            if positions:
-                raise SafetyStop("No daily equity baseline while a position is open.")
             baseline = str(equity)
             self.store.set(day_key, baseline)
         daily_limit = D(baseline) * self.cfg.daily_loss_fraction
@@ -590,7 +551,6 @@ class AegisUltimatePro:
         if self.consecutive_losses >= self.cfg.max_consecutive_losses:
             raise SafetyStop("Maximum consecutive losses reached.")
             
-        # クールダウン完全除去のため時刻制御を排除
         side = self.signal(book)
         if not side:
             return
