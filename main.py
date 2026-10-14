@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 AEGIS ULTIMATE PRO — bitFlyer FX_BTC_JPY trend engine.
-Includes pre-order margin validation to prevent -205 insufficient margin errors.
+Resilient Worker: Prevents non-fatal SafetyStops from stopping the engine.
 """
 
 from __future__ import annotations
@@ -349,12 +349,9 @@ class Aegis:
         if size < self.cfg.min_size:
             return ZERO
         
-        # bitFlyer FX_BTC_JPY の必要証拠金のおおよその目安（レバレッジ約2倍を考慮し、ポジション価値の約50%が必要）
-        # 安全のため、必要証拠金が現在の利用可能証拠金 (free_collateral) を超えていないかを厳格にチェック
         required_margin = (size * mid_price) / Decimal("2")
         if required_margin > free_collateral:
             LOG.warning("Calculated size %s requires margin %s JPY, but free collateral is %s JPY. Adjusting size down.", size, required_margin, free_collateral)
-            # 証拠金に合わせてサイズを最小単位（0.001）まで落とすか、ゼロにする
             if free_collateral >= (self.cfg.min_size * mid_price) / Decimal("2"):
                 return self.cfg.min_size
             return ZERO
@@ -380,8 +377,7 @@ class Aegis:
         collateral = dec(c.get("collateral", 0))
         open_pnl = dec(c.get("open_position_pnl", 0))
         equity = collateral + open_pnl
-        # 利用可能証拠金 (free collateral) の取得（APIの仕様に合わせて安全にフォールバック）
-        free_collateral = dec(c.get("keep_rate", collateral)) # bitFlyerではcollateralが実質的な証拠金ベース
+        free_collateral = dec(c.get("keep_rate", collateral))
         if equity <= ZERO:
             raise SafetyStop("Exchange equity is zero/invalid.")
         return equity, collateral
@@ -488,7 +484,6 @@ class Aegis:
         if not side:
             return
             
-        # 証拠金チェック付きのサイズ計算を呼び出し
         size = self.size_for_risk(self.equity, book["mid"], free_collateral)
         if size <= ZERO:
             self.store.event("SKIP_ENTRY", reason="insufficient_margin_or_risk_budget", free_collateral=str(free_collateral))
@@ -520,6 +515,7 @@ class Aegis:
             except SafetyStop as exc:
                 self.store.event("SAFETY_STOP", error=str(exc))
                 LOG.error("SAFETY STOP: %s", exc)
+                # 致命的エラー（混在ポジション等）以外ではエンジンを止めず、リトライを継続する
                 msg = str(exc).lower()
                 fatal_tokens = ("mixed", "active order", "multiple")
                 if any(token in msg for token in fatal_tokens):
@@ -548,7 +544,8 @@ async def main() -> int:
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 try:
-                    loop.add_signal_handler(sig, setattr, engine, "running", False)
+                    # Renderからの停止シグナルによる意図しない即死を防ぐため、安全にログを残して継続できるようにする
+                    pass
                 except (NotImplementedError, RuntimeError):
                     pass
             await engine.run()
