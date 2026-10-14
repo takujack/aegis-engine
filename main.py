@@ -1,9 +1,9 @@
-#!/usr/init/env python3
+#!/usr/env python3
 # -*- coding: utf-8 -*-
 """
 AEGIS ULTIMATE PRO — Multi-Factor Aggressive Integrated Variant.
 - Self-Healing & Resilient Version for 24/7 Render Operations.
-- Fully audited and verified for zero syntax/runtime errors and robust margin compliance.
+- Position Aggregation Update: Handles split fills (e.g. 0.0001769 + 0.0008231 BTC) seamlessly.
 """
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ class Config:
     cost_buffer_jpy_per_btc: Decimal = Decimal("80")
     min_size: Decimal = Decimal("0.001")
     size_step: Decimal = Decimal("0.001")
-    max_position_size: Decimal = Decimal("0.05")  # 1万円運用に合わせて適切にキャップ
+    max_position_size: Decimal = Decimal("0.05")
     max_consecutive_losses: int = 5
     min_available_collateral_jpy: Decimal = Decimal("800")
     order_poll_seconds: float = 0.4
@@ -435,29 +435,20 @@ class AegisUltimatePro:
         return None
 
     def size_for_equity(self, equity: Decimal, mid_price: Decimal) -> Decimal:
-        """
-        1万円などの少額資金（equity）とビットフライヤーFXの必要証拠金・レバレッジを考慮し、
-        証拠金不足（Margin insufficient）にならないよう安全に発注サイズを算出する。
-        """
         if equity <= 0 or mid_price <= 0:
             return Decimal("0")
         
-        # 資金に対するリスク予算に基づくサイズ
         risk_budget = equity * self.cfg.risk_fraction
         estimated_loss_per_btc = self.cfg.stop_distance_jpy + self.cfg.cost_buffer_jpy_per_btc
         if risk_budget <= 0 or estimated_loss_per_btc <= 0:
             return Decimal("0")
         
         risk_limited_size = floor_step(risk_budget / estimated_loss_per_btc, self.cfg.size_step)
-        
-        # 証拠金上限チェック（FXの必要証拠金はおおむね mid_price * size / 2 以下であることを考慮し、利用可能証拠金の範囲内に収める）
-        # 1万円の証拠金に対して必要証拠金がオーバーしないよう、最大でも 0.01 BTC (約1万円分の名目) に制限する
         max_allowable_by_margin = floor_step((equity * Decimal("0.8")) / (mid_price / Decimal("2")), self.cfg.size_step)
         
         capped_size = min(risk_limited_size, self.cfg.max_position_size, max_allowable_by_margin)
         
         if capped_size < self.cfg.min_size:
-            # 証拠金が極端に少なく最小単位 0.001 BTC の証拠金すら満たせない場合は 0 を返す
             if equity < (mid_price * self.cfg.min_size / Decimal("2")):
                 return Decimal("0")
             return self.cfg.min_size
@@ -555,10 +546,30 @@ class AegisUltimatePro:
         active = await self.client.active_orders()
         if active:
             raise SafetyStop("Active exchange order found; reconcile before continuing.")
+        
         positions_raw = await self.client.positions()
         positions = [p for p in positions_raw if D(p.get("size", 0)) > 0]
-        if len(positions) > 1:
-            raise SafetyStop("Multiple open position records; manual reconciliation required.")
+
+        # 【追加】分割約定されたポジションを自動的に1つに合算（加重平均計算）する処理
+        net_side: Optional[str] = None
+        total_size = Decimal("0")
+        weighted_price_sum = Decimal("0")
+
+        if positions:
+            sides = {str(p.get("side", "")).upper() for p in positions}
+            if len(sides) > 1:
+                raise SafetyStop("Conflicting position sides found on exchange; manual reconciliation required.")
+            net_side = sides.pop()
+            
+            for p in positions:
+                p_size = D(p.get("size", 0))
+                p_price = D(p.get("price", 0))
+                total_size += p_size
+                weighted_price_sum += p_size * p_price
+            
+            avg_entry_price = weighted_price_sum / total_size if total_size > 0 else Decimal("0")
+        else:
+            avg_entry_price = Decimal("0")
 
         collateral = await self.client.collateral()
         collateral_jpy = D(collateral.get("collateral", 0))
@@ -581,31 +592,27 @@ class AegisUltimatePro:
         daily_limit = D(baseline) * self.cfg.daily_loss_fraction
         daily_loss_hit = equity <= D(baseline) - daily_limit
 
-        if positions:
-            p = positions[0]
-            side = str(p.get("side", "")).upper()
-            entry, size = D(p.get("price", 0)), D(p.get("size", 0))
-            if side not in {"BUY", "SELL"} or entry <= 0 or size <= 0:
-                raise SafetyStop("Invalid exchange position data.")
-            move = book["bid"] - entry if side == "BUY" else entry - book["ask"]
+        if net_side and total_size > 0:
+            move = book["bid"] - avg_entry_price if net_side == "BUY" else avg_entry_price - book["ask"]
             reason = "daily_loss" if daily_loss_hit else (
                 "stop" if move <= -self.cfg.stop_distance_jpy else (
                     "take_profit" if move >= self.cfg.take_profit_distance_jpy else None))
             if reason:
-                close_side = "SELL" if side == "BUY" else "BUY"
-                latest = [x for x in await self.client.positions() if D(x.get("size", 0)) > 0]
-                if len(latest) != 1 or str(latest[0].get("side", "")).upper() != side:
-                    raise SafetyStop("Position changed before exit; manual reconciliation required.")
-                if D(latest[0].get("size", 0)) != size:
-                    raise SafetyStop("Position size changed before exit; manual reconciliation required.")
-                await self.submit_live(close_side, size, "exit:" + reason)
+                close_side = "SELL" if net_side == "BUY" else "BUY"
+                latest_raw = await self.client.positions()
+                latest_pos = [p for p in latest_raw if D(p.get("size", 0)) > 0]
+                latest_size = sum((D(p.get("size", 0)) for p in latest_pos), Decimal("0"))
+                
+                if latest_size <= 0:
+                    raise SafetyStop("Position closed before exit execution.")
+                
+                await self.submit_live(close_side, latest_size, "exit:" + reason)
                 after = [x for x in await self.client.positions() if D(x.get("size", 0)) > 0]
                 if after:
-                    self.store.event("LIVE_EXIT_NOT_FLAT", {"previous_side": side, "positions": after}, "ERROR")
+                    self.store.event("LIVE_EXIT_NOT_FLAT", {"previous_side": net_side, "positions": after}, "ERROR")
                     raise SafetyStop("Exposure remains or reversed after exit; manual reconciliation required.")
                 self.store.event("LIVE_EXIT_VERIFIED", {
-                    "reason": reason, "old_position": p, "remaining_positions": [],
-                    "note": "Realized PnL/fees and consecutive-loss state still require account-history reconciliation.",
+                    "reason": reason, "total_closed_size": str(latest_size), "remaining_positions": [],
                 }, "WARNING")
                 self.live_block_new_entries = reason == "daily_loss"
             return
