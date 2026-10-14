@@ -1,10 +1,10 @@
 #!/usr/env python3
 # -*- coding: utf-8 -*-
 """
-AEGIS ULTIMATE PRO — Professional Adaptive Scalping & Trend Engine.
+AEGIS ULTIMATE PRO — Professional Adaptive Scalping & Trend Trailing Engine.
 - Strict 4.0s loop interval to completely eliminate HTTP 429 Rate Limits.
+- Dynamic Trailing Profit: Maximizes gains during strong trends.
 - Volatility-adaptive breakout & range harvesting logic.
-- Dynamic lot scaling on consecutive losses to protect capital.
 """
 from __future__ import annotations
 
@@ -70,9 +70,10 @@ class Config:
     max_spread_bps: Decimal = Decimal("15")
     loop_seconds: float = 4.0  # 4秒固定でレート制限を完全に回避
     
-    # プロ仕様のタイトかつ効率的な利食い・損切り設定
-    stop_distance_jpy: Decimal = Decimal("5000")
-    take_profit_distance_jpy: Decimal = Decimal("7500")
+    # 損切り幅と、トレンド追従用トレーリング設定
+    stop_distance_jpy: Decimal = Decimal("6000")
+    trailing_activation_jpy: Decimal = Decimal("4000")  # この含み益を超えたらトレーリング発動
+    trailing_callback_jpy: Decimal = Decimal("2500")   # 最高益からこの幅逆行したら利食い
     
     min_size: Decimal = Decimal("0.001")
     size_step: Decimal = Decimal("0.001")
@@ -96,7 +97,8 @@ class Config:
             max_spread_bps=D(os.getenv("AEGIS_MAX_SPREAD_BPS", str(d.max_spread_bps))),
             loop_seconds=float(os.getenv("AEGIS_LOOP_SECONDS", str(d.loop_seconds))),
             stop_distance_jpy=D(os.getenv("AEGIS_STOP_DISTANCE_JPY", str(d.stop_distance_jpy))),
-            take_profit_distance_jpy=D(os.getenv("AEGIS_TAKE_PROFIT_DISTANCE_JPY", str(d.take_profit_distance_jpy))),
+            trailing_activation_jpy=D(os.getenv("AEGIS_TRAILING_ACTIVATION_JPY", str(d.trailing_activation_jpy))),
+            trailing_callback_jpy=D(os.getenv("AEGIS_TRAILING_CALLBACK_JPY", str(d.trailing_callback_jpy))),
             min_size=D(os.getenv("AEGIS_MIN_SIZE", str(d.min_size))),
             size_step=D(os.getenv("AEGIS_SIZE_STEP", str(d.size_step))),
             max_position_size=D(os.getenv("AEGIS_MAX_POSITION_SIZE", str(d.max_position_size))),
@@ -235,6 +237,7 @@ class AegisAdaptiveEngine:
         self.running = True
         self.mids: list[Decimal] = []
         self.consecutive_losses = int(store.get("consecutive_losses", 0))
+        self.max_favorable_pnl = Decimal("0")  # トレーリング用の最高益追跡
 
     async def initialize(self) -> None:
         if self.cfg.mode == "LIVE":
@@ -246,17 +249,14 @@ class AegisAdaptiveEngine:
             return None
 
         self.mids.append(book["mid"])
-        self.mids = self.mids[-12:]  # 直近の価格推移を保持
+        self.mids = self.mids[-12:]
 
         if len(self.mids) < 8:
             return None
 
-        # プロ仕様：直近の価格変動モメンタムとボラティリティを複合的に評価
         recent_prices = self.mids[-6:]
         delta = recent_prices[-1] - recent_prices[0]
-        
-        # 微小なレンジの往復とトレンド双方を確実に捉える閾値設計
-        threshold = Decimal("1200") 
+        threshold = Decimal("1000")  # より素早くトレンド初動をキャッチ
 
         if delta >= threshold:
             return "BUY"
@@ -268,9 +268,7 @@ class AegisAdaptiveEngine:
         if equity <= 0 or mid_price <= 0:
             return self.cfg.min_size
         
-        # 連敗時はロットを自動縮小してドローダウンを完全に防御
         penalty_factor = max(Decimal("0.3"), Decimal("1.0") - (Decimal(str(self.consecutive_losses)) * Decimal("0.1")))
-        
         base_size = floor_step((equity * Decimal("0.5") * penalty_factor) / (mid_price / Decimal("2")), self.cfg.size_step)
         return max(self.cfg.min_size, min(base_size, self.cfg.max_position_size))
 
@@ -293,27 +291,40 @@ class AegisAdaptiveEngine:
             avg_entry_price = weighted_price_sum / total_size if total_size > 0 else Decimal("0")
         else:
             avg_entry_price = Decimal("0")
+            self.max_favorable_pnl = Decimal("0")  # ポジションがないときは最高益をリセット
 
         collateral = await self.client.collateral()
         equity = D(collateral.get("collateral", 0)) + D(collateral.get("open_position_pnl", 0))
         if equity <= 0:
             equity = self.cfg.starting_equity_jpy
 
-        # ポジション保有中の利食い・損切り判定
+        # ポジション保有中の損切り ＆ トレーリング・プロフィット判定
         if net_side and total_size > 0:
-            move = book["bid"] - avg_entry_price if net_side == "BUY" else avg_entry_price - book["ask"]
+            current_move = book["bid"] - avg_entry_price if net_side == "BUY" else avg_entry_price - book["ask"]
             
-            if move <= -self.cfg.stop_distance_jpy or move >= self.cfg.take_profit_distance_jpy:
+            # 1. 損切り判定
+            if current_move <= -self.cfg.stop_distance_jpy:
                 close_side = "SELL" if net_side == "BUY" else "BUY"
                 await self.client.send_market(close_side, total_size)
-                
-                if move < 0:
-                    self.consecutive_losses += 1
-                else:
-                    self.consecutive_losses = 0
+                self.consecutive_losses += 1
                 self.store.set("consecutive_losses", self.consecutive_losses)
-                
-                self.store.event("TRADE_CLOSE", {"move": str(move), "pnl_status": "LOSS" if move < 0 else "WIN"})
+                self.store.event("TRADE_CLOSE", {"reason": "STOP_LOSS", "move": str(current_move)})
+                return
+
+            # 2. トレーリング・プロフィット（利益追従）の更新と判定
+            if current_move > self.max_favorable_pnl:
+                self.max_favorable_pnl = current_move  # 最高益を更新
+
+            # 一定の含み益（Activation）に達した後の押し目撤退（Callback）
+            if self.max_favorable_pnl >= self.cfg.trailing_activation_jpy:
+                drawdown_from_peak = self.max_favorable_pnl - current_move
+                if drawdown_from_peak >= self.cfg.trailing_callback_jpy:
+                    close_side = "SELL" if net_side == "BUY" else "BUY"
+                    await self.client.send_market(close_side, total_size)
+                    self.consecutive_losses = 0
+                    self.store.set("consecutive_losses", self.consecutive_losses)
+                    self.store.event("TRADE_CLOSE", {"reason": "TRAILING_PROFIT", "peak": str(self.max_favorable_pnl), "move": str(current_move)})
+                    return
             return
 
         # 新規エントリー判定
@@ -323,11 +334,12 @@ class AegisAdaptiveEngine:
 
         size = self.calculate_size(equity, book["mid"])
         await self.client.send_market(signal, size)
+        self.max_favorable_pnl = Decimal("0")
         self.store.event("TRADE_OPEN", {"side": signal, "size": str(size)})
 
     async def run(self) -> None:
         self.store.event("START", {"mode": self.cfg.mode})
-        LOG.info("Aegis Adaptive Engine started in %s mode.", self.cfg.mode)
+        LOG.info("Aegis Adaptive Engine (Trailing Edition) started in %s mode.", self.cfg.mode)
         await self.initialize()
 
         while self.running:
