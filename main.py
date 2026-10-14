@@ -1,10 +1,10 @@
 #!/usr/env python3
 # -*- coding: utf-8 -*-
 """
-AEGIS ULTIMATE PRO — Professional Adaptive Scalping & Trend Trailing Engine.
+AEGIS ULTIMATE PRO — Professional Trend-Only & Zero-Noise Engine.
 - Strict 4.0s loop interval to completely eliminate HTTP 429 Rate Limits.
-- Dynamic Trailing Profit: Maximizes gains during strong trends.
-- Volatility-adaptive breakout & range harvesting logic.
+- Volatility Gate: Strictly refuses to trade in low-volatility chop/ranges.
+- Dynamic Trailing Profit: Maximizes gains when real trends occur.
 """
 from __future__ import annotations
 
@@ -67,13 +67,16 @@ class Config:
 
     starting_equity_jpy: Decimal = Decimal("10000")
     daily_loss_fraction: Decimal = Decimal("0.30")
-    max_spread_bps: Decimal = Decimal("15")
+    max_spread_bps: Decimal = Decimal("12")  # スプレッド条件をさらに厳格化しコスト負けを防ぐ
     loop_seconds: float = 4.0  # 4秒固定でレート制限を完全に回避
     
-    # 損切り幅と、トレンド追従用トレーリング設定
-    stop_distance_jpy: Decimal = Decimal("6000")
-    trailing_activation_jpy: Decimal = Decimal("4000")  # この含み益を超えたらトレーリング発動
-    trailing_callback_jpy: Decimal = Decimal("2500")   # 最高益からこの幅逆行したら利食い
+    # トレンド専用の堅牢な損切り・トレーリング設定
+    stop_distance_jpy: Decimal = Decimal("7000")
+    trailing_activation_jpy: Decimal = Decimal("5000")
+    trailing_callback_jpy: Decimal = Decimal("3000")
+    
+    # ノイズを完全に弾くための最小ボラティリティ閾値（これ未満の値幅では絶対にエントリーしない）
+    min_volatility_jpy: Decimal = Decimal("2500")
     
     min_size: Decimal = Decimal("0.001")
     size_step: Decimal = Decimal("0.001")
@@ -99,6 +102,7 @@ class Config:
             stop_distance_jpy=D(os.getenv("AEGIS_STOP_DISTANCE_JPY", str(d.stop_distance_jpy))),
             trailing_activation_jpy=D(os.getenv("AEGIS_TRAILING_ACTIVATION_JPY", str(d.trailing_activation_jpy))),
             trailing_callback_jpy=D(os.getenv("AEGIS_TRAILING_CALLBACK_JPY", str(d.trailing_callback_jpy))),
+            min_volatility_jpy=D(os.getenv("AEGIS_MIN_VOLATILITY_JPY", str(d.min_volatility_jpy))),
             min_size=D(os.getenv("AEGIS_MIN_SIZE", str(d.min_size))),
             size_step=D(os.getenv("AEGIS_SIZE_STEP", str(d.size_step))),
             max_position_size=D(os.getenv("AEGIS_MAX_POSITION_SIZE", str(d.max_position_size))),
@@ -237,7 +241,7 @@ class AegisAdaptiveEngine:
         self.running = True
         self.mids: list[Decimal] = []
         self.consecutive_losses = int(store.get("consecutive_losses", 0))
-        self.max_favorable_pnl = Decimal("0")  # トレーリング用の最高益追跡
+        self.max_favorable_pnl = Decimal("0")
 
     async def initialize(self) -> None:
         if self.cfg.mode == "LIVE":
@@ -249,14 +253,24 @@ class AegisAdaptiveEngine:
             return None
 
         self.mids.append(book["mid"])
-        self.mids = self.mids[-12:]
+        self.mids = self.mids[-15:]
 
-        if len(self.mids) < 8:
+        if len(self.mids) < 10:
             return None
 
-        recent_prices = self.mids[-6:]
-        delta = recent_prices[-1] - recent_prices[0]
-        threshold = Decimal("1000")  # より素早くトレンド初動をキャッチ
+        # ボラティリティ・フィルター（直近の高低差を算出）
+        recent_window = self.mids[-10:]
+        high_price = max(recent_window)
+        low_price = min(recent_window)
+        volatility = high_price - low_price
+
+        # もみ合い相場（ボラティリティ不足）では絶対にエントリーしない
+        if volatility < self.cfg.min_volatility_jpy:
+            return None
+
+        # トレンド方向の判定
+        delta = recent_window[-1] - recent_window[0]
+        threshold = Decimal("1500")
 
         if delta >= threshold:
             return "BUY"
@@ -291,7 +305,7 @@ class AegisAdaptiveEngine:
             avg_entry_price = weighted_price_sum / total_size if total_size > 0 else Decimal("0")
         else:
             avg_entry_price = Decimal("0")
-            self.max_favorable_pnl = Decimal("0")  # ポジションがないときは最高益をリセット
+            self.max_favorable_pnl = Decimal("0")
 
         collateral = await self.client.collateral()
         equity = D(collateral.get("collateral", 0)) + D(collateral.get("open_position_pnl", 0))
@@ -311,11 +325,10 @@ class AegisAdaptiveEngine:
                 self.store.event("TRADE_CLOSE", {"reason": "STOP_LOSS", "move": str(current_move)})
                 return
 
-            # 2. トレーリング・プロフィット（利益追従）の更新と判定
+            # 2. トレーリング・プロフィット判定
             if current_move > self.max_favorable_pnl:
-                self.max_favorable_pnl = current_move  # 最高益を更新
+                self.max_favorable_pnl = current_move
 
-            # 一定の含み益（Activation）に達した後の押し目撤退（Callback）
             if self.max_favorable_pnl >= self.cfg.trailing_activation_jpy:
                 drawdown_from_peak = self.max_favorable_pnl - current_move
                 if drawdown_from_peak >= self.cfg.trailing_callback_jpy:
@@ -327,7 +340,7 @@ class AegisAdaptiveEngine:
                     return
             return
 
-        # 新規エントリー判定
+        # 新規エントリー判定（ボラティリティフィルター通過時のみ実行）
         signal = self.generate_signal(book)
         if not signal:
             return
@@ -339,7 +352,7 @@ class AegisAdaptiveEngine:
 
     async def run(self) -> None:
         self.store.event("START", {"mode": self.cfg.mode})
-        LOG.info("Aegis Adaptive Engine (Trailing Edition) started in %s mode.", self.cfg.mode)
+        LOG.info("Aegis Adaptive Engine (Zero-Noise Volatility Gate Edition) started in %s mode.", self.cfg.mode)
         await self.initialize()
 
         while self.running:
